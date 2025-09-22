@@ -22,7 +22,7 @@ A minimal command-line utility that wraps shell commands and sends HTML-formatte
 
 ```bash
 # Install for current user
-curl -fsSL https://raw.githubusercontent.com/user/mailonerror/main/install.sh | bash -s -- --user --create-config
+curl -fsSL https://raw.githubusercontent.com/christianluis/mailonerror/main/install.sh | bash -s -- --user --create-config
 
 # Or clone and install from source
 git clone https://github.com/christianluis/mailonerror.git
@@ -72,12 +72,12 @@ mailonerror --dry-run -- ls /nonexistent
 
 **For current user:**
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/user/mailonerror/main/install.sh) --user --create-config
+bash <(curl -fsSL https://raw.githubusercontent.com/christianluis/mailonerror/main/install.sh) --user --create-config
 ```
 
 **System-wide (requires sudo):**
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/user/mailonerror/main/install.sh) --system
+bash <(curl -fsSL https://raw.githubusercontent.com/christianluis/mailonerror/main/install.sh) --system
 ```
 
 ### Manual Installation
