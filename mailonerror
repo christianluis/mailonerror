@@ -262,10 +262,56 @@ read_from_stdin() {
         fi
     fi
     
-    # For stdin mode, we treat the input as both stdout and the command description
-    MOE_STDOUT_OUTPUT=$(cat "$temp_stdin")
-    MOE_STDERR_OUTPUT=""
-    MOE_COMMAND="<stdin>"
+    # For stdin mode, we treat the input as stdout and provide diagnostic information
+    local stdin_content
+    stdin_content=$(cat "$temp_stdin")
+    
+    # Enhance stdout with diagnostic information for better email content
+    if [[ "$MOE_FORCE_FAILURE" == "true" ]]; then
+        MOE_STDOUT_OUTPUT="$stdin_content
+
+[mailonerror diagnostic] Force failure mode was enabled, treating any stdin input as command failure."
+        MOE_STDERR_OUTPUT=""
+    elif [[ -z "$stdin_content" ]]; then
+        MOE_STDOUT_OUTPUT=""
+        MOE_STDERR_OUTPUT="[mailonerror diagnostic] No output was piped to mailonerror. 
+This typically indicates a command that failed silently or produced no output.
+The failure was inferred because empty stdin often indicates a problem.
+
+Common scenarios:
+- 'exit 1 | mailonerror' - explicit failure with no output
+- 'command_that_fails_silently | mailonerror' - silent command failure
+- 'timeout 1 long_running_command | mailonerror' - command timeout
+
+To provide more context, consider using:
+- mailonerror -- your_command  (to capture actual command output)
+- your_command 2>&1 | mailonerror  (to include stderr in the pipe)"
+    elif echo "$stdin_content" | grep -qi -E "(error|failed|exception|fatal|critical)"; then
+        MOE_STDOUT_OUTPUT="$stdin_content
+
+[mailonerror diagnostic] Failure detected due to error keywords in the piped output.
+The following keywords triggered failure detection: error, failed, exception, fatal, critical"
+        MOE_STDERR_OUTPUT=""
+    else
+        MOE_STDOUT_OUTPUT="$stdin_content"
+        MOE_STDERR_OUTPUT=""
+    fi
+    
+    # Create a more informative command description based on what we detected
+    if [[ "$MOE_FORCE_FAILURE" == "true" ]]; then
+        MOE_COMMAND="stdin input (forced failure mode)"
+    elif [[ -z "$stdin_content" ]]; then
+        MOE_COMMAND="piped command with no output (inferred failure)"
+    elif echo "$stdin_content" | grep -qi -E "(error|failed|exception|fatal|critical)"; then
+        MOE_COMMAND="stdin input containing error keywords"
+    else
+        local content_preview
+        content_preview=$(echo "$stdin_content" | head -1 | cut -c1-100)
+        if [[ ${#stdin_content} -gt 100 ]]; then
+            content_preview="${content_preview}..."
+        fi
+        MOE_COMMAND="stdin input: \"$content_preview\""
+    fi
     
     rm -f "$temp_stdin"
     
@@ -380,6 +426,34 @@ main() {
             echo "=== Dry Run Mode (stdin) ==="
             echo "Would process stdin input"
             echo "Configuration: ${MOE_CONFIG_FILE:-$MOE_DEFAULT_CONFIG_FILE}"
+            echo "From: ${MOE_from:-<not set>}"
+            echo "To: ${MOE_to:-<not set>}"
+            echo
+            
+            # Process stdin to determine what would be sent
+            read_from_stdin || true
+            
+            echo "Detected scenario:"
+            echo "  Command: $MOE_COMMAND"
+            echo "  Exit Code: $MOE_EXIT_CODE"
+            echo "  Would send notification: $([ $MOE_EXIT_CODE -ne 0 ] && echo "YES" || echo "NO")"
+            
+            if [[ $MOE_EXIT_CODE -ne 0 ]]; then
+                echo
+                echo "Would send email with subject:"
+                echo "  $(render_subject)"
+                echo
+                echo "Would send HTML body (preview):"
+                render_html_body | head -20
+                echo "..."
+                
+                if [[ -n "${MOE_slack_webhook_url:-}" ]]; then
+                    echo
+                    echo "Would send Slack message:"
+                    render_slack_message | head -10
+                    echo "..."
+                fi
+            fi
             return 0
         fi
         
