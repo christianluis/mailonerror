@@ -131,7 +131,13 @@ parse_args() {
 # Detect if we're running from a source directory or as a standalone script
 detect_installation_source() {
     local script_dir
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    # Handle case where BASH_SOURCE might not be set (e.g., when piped from curl)
+    if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    else
+        # Fallback when BASH_SOURCE is not available (curl pipe scenario)
+        script_dir="$(pwd)"
+    fi
     
     # Check if we're in a source directory with the expected structure
     if [[ -f "$script_dir/mailonerror" && -d "$script_dir/lib" && -d "$script_dir/templates" ]]; then
@@ -401,6 +407,7 @@ main() {
 }
 
 # Run main function if script is executed directly
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+# Handle case where BASH_SOURCE might not be set (e.g., when piped from curl)
+if [[ -z "${BASH_SOURCE[0]:-}" ]] || [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     main "$@"
 fi
