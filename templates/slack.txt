@@ -1,0 +1,19 @@
+🚨 *Command Failed on ${HOSTNAME}*
+
+*Command:* `${COMMAND}`
+*Exit Code:* ${EXIT_CODE}
+*User:* ${USER}
+*Timestamp:* ${TIMESTAMP}
+
+*📤 stdout:*
+```
+${STDOUT}
+```
+
+*🚨 stderr:*
+```
+${STDERR}
+```
+
+---
+_This alert was sent by mailonerror_

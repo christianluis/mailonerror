@@ -1,0 +1,416 @@
+#!/bin/bash
+
+# mailonerror - A minimal command-line utility that wraps shell commands
+# and sends email/Slack notifications on failure
+# Language: Bash 4.0+
+
+set -euo pipefail
+
+# Script directory for sourcing lib files
+MOE_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Determine library and template directories
+# Check if running from source directory or installed location
+if [[ -d "${MOE_SCRIPT_DIR}/lib" ]]; then
+    # Running from source directory
+    MOE_LIB_DIR="${MOE_SCRIPT_DIR}/lib"
+    MOE_TEMPLATES_DIR="${MOE_SCRIPT_DIR}/templates"
+elif [[ -d "${MOE_SCRIPT_DIR}/../share/mailonerror/lib" ]]; then
+    # Running from installed location (user or system install)
+    MOE_LIB_DIR="${MOE_SCRIPT_DIR}/../share/mailonerror/lib"
+    MOE_TEMPLATES_DIR="${MOE_SCRIPT_DIR}/../share/mailonerror/templates"
+else
+    echo "[mailonerror ERROR] Cannot find library files. Installation may be corrupted." >&2
+    echo "[mailonerror ERROR] Expected lib directory at:" >&2
+    echo "[mailonerror ERROR]   ${MOE_SCRIPT_DIR}/lib (source)" >&2
+    echo "[mailonerror ERROR]   ${MOE_SCRIPT_DIR}/../share/mailonerror/lib (installed)" >&2
+    exit 1
+fi
+
+# Source library functions
+source "${MOE_LIB_DIR}/config.sh"
+source "${MOE_LIB_DIR}/templates.sh"
+source "${MOE_LIB_DIR}/mailer.sh"
+source "${MOE_LIB_DIR}/slack.sh"
+
+# Default configuration
+MOE_DEFAULT_CONFIG_FILE="${HOME}/.mailonerror/config"
+MOE_CONFIG_FILE=""
+MOE_DRY_RUN=false
+MOE_SELF_TEST=false
+MOE_VERBOSE=false
+MOE_RETRY_ENABLED=false
+MOE_FORCE_FAILURE=false
+
+# Override variables
+MOE_OVERRIDE_FROM=""
+MOE_OVERRIDE_TO=""
+MOE_OVERRIDE_SUBJECT=""
+MOE_OVERRIDE_HTML_BODY_FILE=""
+MOE_OVERRIDE_SENDGRID_KEY=""
+MOE_OVERRIDE_SLACK_WEBHOOK=""
+MOE_OVERRIDE_SLACK_MESSAGE_FILE=""
+
+# Command to execute
+MOE_COMMAND_ARGS=()
+
+# Global variables for template substitution
+MOE_COMMAND=""
+MOE_EXIT_CODE=""
+MOE_STDOUT_OUTPUT=""
+MOE_STDERR_OUTPUT=""
+MOE_TIMESTAMP=""
+HOSTNAME=$(hostname)
+USER=$(whoami)
+
+# Print usage information
+usage() {
+    cat << EOF
+mailonerror - Wraps shell commands and sends notifications on failure
+
+USAGE:
+    mailonerror [OPTIONS] -- command [args...]
+    command | mailonerror [OPTIONS]
+    command && echo ok || mailonerror [OPTIONS]
+
+OPTIONS:
+    --config FILE           Use an alternative config file
+    --from EMAIL            Override sender address
+    --to EMAIL              Override recipient address
+    --subject TEXT          Override subject template
+    --html-body FILE        Path to HTML body template
+    --sendgrid-key KEY      Override SendGrid API key
+    --slack-webhook URL     Slack webhook URL
+    --slack-message FILE    Slack message template
+    --dry-run               Simulate behavior without sending
+    --self-test             Send test email and Slack message
+    --retry                 Enable retry loop for email delivery
+    --force-failure         Force notification when reading from stdin
+    --verbose               Enable debug output
+    --help                  Show this help message
+    --                      Everything after this is treated as the command
+
+EXAMPLES:
+    mailonerror -- ls -la /nonexistent
+    backup.sh | mailonerror --verbose
+    mailonerror --dry-run -- failing-command
+    mailonerror --self-test
+
+EOF
+}
+
+# Verbose logging
+log_verbose() {
+    if [[ "$MOE_VERBOSE" == "true" ]]; then
+        echo "[mailonerror] $*" >&2
+    fi
+}
+
+# Error logging
+log_error() {
+    echo "[mailonerror ERROR] $*" >&2
+}
+
+# Parse command line arguments
+parse_args() {
+    local parsing_command=false
+    
+    while [[ $# -gt 0 ]]; do
+        if [[ "$parsing_command" == "true" ]]; then
+            MOE_COMMAND_ARGS+=("$1")
+            shift
+            continue
+        fi
+        
+        case $1 in
+            --config)
+                MOE_CONFIG_FILE="$2"
+                shift 2
+                ;;
+            --from)
+                MOE_OVERRIDE_FROM="$2"
+                shift 2
+                ;;
+            --to)
+                MOE_OVERRIDE_TO="$2"
+                shift 2
+                ;;
+            --subject)
+                MOE_OVERRIDE_SUBJECT="$2"
+                shift 2
+                ;;
+            --html-body)
+                MOE_OVERRIDE_HTML_BODY_FILE="$2"
+                shift 2
+                ;;
+            --sendgrid-key)
+                MOE_OVERRIDE_SENDGRID_KEY="$2"
+                shift 2
+                ;;
+            --slack-webhook)
+                MOE_OVERRIDE_SLACK_WEBHOOK="$2"
+                shift 2
+                ;;
+            --slack-message)
+                MOE_OVERRIDE_SLACK_MESSAGE_FILE="$2"
+                shift 2
+                ;;
+            --dry-run)
+                MOE_DRY_RUN=true
+                shift
+                ;;
+            --self-test)
+                MOE_SELF_TEST=true
+                shift
+                ;;
+            --retry)
+                MOE_RETRY_ENABLED=true
+                shift
+                ;;
+            --force-failure)
+                MOE_FORCE_FAILURE=true
+                shift
+                ;;
+            --verbose)
+                MOE_VERBOSE=true
+                shift
+                ;;
+            --help)
+                usage
+                exit 0
+                ;;
+            --)
+                parsing_command=true
+                shift
+                ;;
+            *)
+                if [[ "$1" =~ ^-- ]]; then
+                    log_error "Unknown option: $1"
+                    usage
+                    exit 1
+                else
+                    # If no -- was provided, treat remaining args as command
+                    MOE_COMMAND_ARGS+=("$1")
+                    shift
+                fi
+                ;;
+        esac
+    done
+}
+
+# Execute command and capture output
+execute_command() {
+    local temp_stdout temp_stderr
+    temp_stdout=$(mktemp)
+    temp_stderr=$(mktemp)
+    
+    log_verbose "Executing command: ${MOE_COMMAND_ARGS[*]}"
+    
+    # Execute command and capture exit code, stdout, and stderr
+    set +e
+    "${MOE_COMMAND_ARGS[@]}" > "$temp_stdout" 2> "$temp_stderr"
+    MOE_EXIT_CODE=$?
+    set -e
+    
+    # Read captured output
+    MOE_STDOUT_OUTPUT=$(cat "$temp_stdout")
+    MOE_STDERR_OUTPUT=$(cat "$temp_stderr")
+    
+    # Cleanup temp files
+    rm -f "$temp_stdout" "$temp_stderr"
+    
+    log_verbose "Command exited with code: $MOE_EXIT_CODE"
+    
+    return $MOE_EXIT_CODE
+}
+
+# Read from stdin if no command provided
+read_from_stdin() {
+    local temp_stdin
+    temp_stdin=$(mktemp)
+    
+    log_verbose "Reading from stdin..."
+    
+    # Read stdin content
+    cat > "$temp_stdin"
+    
+    # For stdin mode, we have several strategies to detect failure:
+    # 1. If --force-failure is specified, always treat as failure
+    # 2. If stdin is empty or contains error indicators, treat as potential failure
+    # 3. By default, assume success (exit code 0) for stdin mode
+    
+    if [[ "$MOE_FORCE_FAILURE" == "true" ]]; then
+        MOE_EXIT_CODE=1
+        log_verbose "Force failure mode enabled, treating stdin input as failed command"
+    else
+        # Check if stdin contains common error indicators
+        local stdin_content
+        stdin_content=$(cat "$temp_stdin")
+        
+        if [[ -z "$stdin_content" ]]; then
+            # Empty stdin might indicate a problem
+            MOE_EXIT_CODE=1
+            log_verbose "Empty stdin detected, treating as failure"
+        elif echo "$stdin_content" | grep -qi -E "(error|failed|exception|fatal|critical)"; then
+            # Stdin contains error keywords
+            MOE_EXIT_CODE=1
+            log_verbose "Error keywords detected in stdin, treating as failure"
+        else
+            # Default: assume success for stdin mode
+            MOE_EXIT_CODE=0
+            log_verbose "No failure indicators detected, treating stdin as success"
+        fi
+    fi
+    
+    # For stdin mode, we treat the input as both stdout and the command description
+    MOE_STDOUT_OUTPUT=$(cat "$temp_stdin")
+    MOE_STDERR_OUTPUT=""
+    MOE_COMMAND="<stdin>"
+    
+    rm -f "$temp_stdin"
+    
+    log_verbose "Stdin processing completed with inferred exit code: $MOE_EXIT_CODE"
+    
+    return $MOE_EXIT_CODE
+}
+
+# Perform self-test
+self_test() {
+    log_verbose "Performing self-test..."
+    
+    # Set test data
+    MOE_COMMAND="test-command --flag"
+    MOE_EXIT_CODE=1
+    MOE_STDOUT_OUTPUT="Test stdout output"
+    MOE_STDERR_OUTPUT="Test stderr output"
+    MOE_TIMESTAMP=$(date -Iseconds)
+    
+    echo "=== Self-Test Mode ==="
+    echo "Configuration loaded from: ${MOE_CONFIG_FILE:-$MOE_DEFAULT_CONFIG_FILE}"
+    echo
+    
+    # Load and display configuration
+    load_config
+    echo "Configuration:"
+    echo "  From: ${MOE_from:-<not set>}"
+    echo "  To: ${MOE_to:-<not set>}"
+    echo "  SendGrid API Key: ${MOE_sendgrid_api_key:+<set>}${MOE_sendgrid_api_key:-<not set>}"
+    echo "  Slack Webhook: ${MOE_slack_webhook_url:+<set>}${MOE_slack_webhook_url:-<not set>}"
+    echo
+    
+    # Test template rendering
+    echo "Rendered Templates:"
+    echo "  Subject: $(render_subject)"
+    echo "  HTML Body: $(render_html_body | head -3)..."
+    if [[ -n "${MOE_slack_webhook_url:-}" ]]; then
+        echo "  Slack Message: $(render_slack_message | head -2)..."
+    fi
+    echo
+    
+    # Send test notifications
+    echo "Sending test notifications..."
+    
+    if send_email; then
+        echo "✓ Test email sent successfully"
+    else
+        echo "✗ Test email failed"
+    fi
+    
+    if [[ -n "${MOE_slack_webhook_url:-}" ]]; then
+        if send_slack; then
+            echo "✓ Test Slack message sent successfully"
+        else
+            echo "✗ Test Slack message failed"
+        fi
+    else
+        echo "- Slack webhook not configured, skipping"
+    fi
+    
+    echo "Self-test completed."
+}
+
+# Main execution function
+main() {
+    parse_args "$@"
+    
+    # Set timestamp
+    MOE_TIMESTAMP=$(date -Iseconds)
+    
+    # Load configuration
+    load_config
+    
+    # Handle self-test mode
+    if [[ "$MOE_SELF_TEST" == "true" ]]; then
+        self_test
+        return 0
+    fi
+    
+    # Determine execution mode
+    local exit_code=0
+    
+    if [[ ${#MOE_COMMAND_ARGS[@]} -gt 0 ]]; then
+        # Command mode
+        MOE_COMMAND="${MOE_COMMAND_ARGS[*]}"
+        
+        if [[ "$MOE_DRY_RUN" == "true" ]]; then
+            echo "=== Dry Run Mode ==="
+            echo "Would execute: $MOE_COMMAND"
+            echo "Configuration: ${MOE_CONFIG_FILE:-$MOE_DEFAULT_CONFIG_FILE}"
+            echo "From: ${MOE_from:-<not set>}"
+            echo "To: ${MOE_to:-<not set>}"
+            echo
+            echo "Would send email on failure with subject:"
+            echo "  $(render_subject)"
+            echo
+            echo "Would send HTML body (preview):"
+            render_html_body | head -10
+            
+            if [[ -n "${MOE_slack_webhook_url:-}" ]]; then
+                echo
+                echo "Would send Slack message:"
+                render_slack_message
+            fi
+            return 0
+        fi
+        
+        execute_command || exit_code=$?
+    else
+        # Stdin mode
+        if [[ "$MOE_DRY_RUN" == "true" ]]; then
+            echo "=== Dry Run Mode (stdin) ==="
+            echo "Would process stdin input"
+            echo "Configuration: ${MOE_CONFIG_FILE:-$MOE_DEFAULT_CONFIG_FILE}"
+            return 0
+        fi
+        
+        read_from_stdin || exit_code=$?
+    fi
+    
+    # Only send notifications on failure (non-zero exit code)
+    if [[ $exit_code -ne 0 ]]; then
+        log_verbose "Command failed with exit code $exit_code, sending notifications..."
+        
+        # Send email notification
+        if send_email; then
+            log_verbose "Email notification sent successfully"
+        else
+            log_error "Failed to send email notification"
+        fi
+        
+        # Send Slack notification if configured
+        if [[ -n "${MOE_slack_webhook_url:-}" ]]; then
+            if send_slack; then
+                log_verbose "Slack notification sent successfully"
+            else
+                log_error "Failed to send Slack notification"
+            fi
+        fi
+    else
+        log_verbose "Command succeeded, no notifications needed"
+    fi
+    
+    return $exit_code
+}
+
+# Run main function with all arguments
+main "$@"
